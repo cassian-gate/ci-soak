@@ -1,0 +1,179 @@
+# DIAGNOSTIC ONLY -- not a soak run, not counted, not P6'. Reproduces soak run
+# 43910519362 step 35 (fw1 "is not running" right after deploy of
+# three-frr-two-hosts-fw-routed) on a fresh hosted runner with the same prep,
+# and records why fw1 stopped. Then runs step 40's exact commands (VM assertion
+# leg) on W1's image, as information only.
+name: DIAG fw1 (step 35)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "src"
+    steps:
+      - name: "[soak A2] Runner baseline"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/soak"
+          {
+            echo "event=${GITHUB_EVENT_NAME} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} stress=${SOAK_STRESS}"
+            echo "start_utc=$(date -u +%FT%TZ)"
+            echo "vcpu=$(nproc) mem_total_kib=$(awk '/MemTotal/{print $2}' /proc/meminfo) swap_total_kib=$(awk '/SwapTotal/{print $2}' /proc/meminfo)"
+            echo "cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+            echo "disk_root_free=$(df -h / | awk 'NR==2{print $4}')"
+            echo "kernel=$(uname -r) image_os=${ImageOS:-unknown} image_version=${ImageVersion:-unknown}"
+            echo "docker_server=$(docker version --format '{{.Server.Version}}')"
+            echo "dev_kvm=$(test -e /dev/kvm && echo yes || echo NO)"
+          } | tee "$RUNNER_TEMP/soak/baseline.txt"
+          test -e /dev/kvm
+        env:
+          SOAK_STRESS: "false"
+
+      - name: "[soak A2] Enable KVM for the runner user"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle --timeout=30
+          sudo chmod 0666 /dev/kvm
+          ls -l /dev/kvm
+          test -w /dev/kvm
+          echo "/dev/kvm writable" | tee -a "$RUNNER_TEMP/soak/baseline.txt"
+
+      - name: "[soak A2] Install containerlab 0.72.0 (pinned, as ai-netsim)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E bash -c "$(curl -sL https://get.containerlab.dev)" -- -v 0.72.0
+          v=$(containerlab version)
+          echo "$v"
+          echo "$v" | grep -E '^[[:space:]]*version:[[:space:]]*0\.72\.0[[:space:]]*$'
+          echo "containerlab=0.72.0" | tee -a "$RUNNER_TEMP/soak/baseline.txt"
+
+      - name: "[soak A2] Log in to ghcr.io (read; for the prep pulls)"
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "[soak A2] Pull every gate image by pinned digest; E1 before the SONiC local tag"
+        shell: bash
+        env:
+          SONIC_REF: "ghcr.io/cassian-gate/sonic-vm@sha256:29527a63aec3422e0eda0e953bc4cd29930eb98523d7ac960d0cd05f82957151"
+          SONIC_LAYERS: '["sha256:66462cc862fe2053b9863fefa3866e07bb5dfb06f6b3ce3177cc096e4021aabe","sha256:28a67079e0fc0971ec736ceded35c9563015b8a86cd4971cd3284d84293db9d6","sha256:f42b40d4bcc2d45560476ee10603449840bace56fe51e93fcde7c1a0c1071e35","sha256:8b9f6a93a1a6b39da64c074f2c2a457948c56ee8676c0537cf5d12a58bbb231c","sha256:ee057f702a74e9205da0d746d536ed55b09373cdca50d59347c436bfe7bdd9ec"]'
+          SONIC_QCOW2: "sonic-vs-202405.qcow2"
+          SONIC_QCOW2_SHA256: "dda614679cfeed69aa4b6e2b8f9dbdf68c2d0671eceef8ca42f9b6832f120817"
+          NFT_REF: "ghcr.io/cassian-gate/nft-fw:latest"
+          NFT_LAYERS: '["sha256:abfcb263a58861178d439ff49c8d87ef7f1ec7b881ecaa9a906387366dea86d2","sha256:3312565b62e8cbba0b3da06195f190c0560d698a5600ff1f00c1ce186c70a39f"]'
+        run: |
+          set -euo pipefail
+          rec() { echo "$*" | tee -a "$RUNNER_TEMP/soak/prep.txt"; }
+          pull_tag() {  # $1 = digest-pinned ref, $2 = the name the gate resolves
+            local t0 t1
+            t0=$(date +%s); docker pull -q "$1" >/dev/null; t1=$(date +%s)
+            docker tag "$1" "$2"
+            rec "image $2 <- $1 pull_s=$((t1 - t0))"
+          }
+          # --- W1 / E1: CI's exact SONiC build. It gets the gate's local tag
+          # only if both identity checks pass, so no gate step can boot
+          # anything else.
+          t0=$(date +%s); docker pull -q "$SONIC_REF" >/dev/null; t1=$(date +%s)
+          rec "sonic pull_s=$((t1 - t0)) ref=$SONIC_REF"
+          rec "sonic image_id_runner=$(docker image inspect -f '{{.Id}}' "$SONIC_REF")"
+          layers=$(docker image inspect -f '{{json .RootFS.Layers}}' "$SONIC_REF")
+          rec "E1 layers_runner=$layers"
+          python3 -c 'import json,os,sys; a=json.loads(os.environ["SONIC_LAYERS"]); b=json.loads(sys.argv[1]); ok=(a==b); print("E1 layers_equal=%s" % ok); sys.exit(0 if ok else 1)' "$layers" \
+            | tee -a "$RUNNER_TEMP/soak/prep.txt"
+          q=$(docker run --rm --network none -w / --entrypoint sha256sum "$SONIC_REF" "$SONIC_QCOW2" | awk '{print $1}')
+          rec "E1 qcow2_sha256_runner=$q"
+          if [ "$q" = "$SONIC_QCOW2_SHA256" ]; then rec "E1 qcow2_equal=True"; else rec "E1 qcow2_equal=False"; exit 1; fi
+          docker tag "$SONIC_REF" local/sonic-vm:202405
+          rec "image local/sonic-vm:202405 <- $SONIC_REF (E1 passed)"
+          # --- Every other image the gate resolves, at the digest ai-netsim holds.
+          # nft-fw: GHCR already holds ai-netsim's image under the name the gate
+          # resolves; it is pulled by that tag and its identity is checked on
+          # the RootFS diffIDs (a moved tag fails here, loudly).
+          t0=$(date +%s); docker pull -q "$NFT_REF" >/dev/null; t1=$(date +%s)
+          rec "nft-fw pull_s=$((t1 - t0)) ref=$NFT_REF repo_digests=$(docker image inspect -f '{{json .RepoDigests}}' "$NFT_REF")"
+          nl=$(docker image inspect -f '{{json .RootFS.Layers}}' "$NFT_REF")
+          python3 -c 'import json,os,sys; ok=json.loads(os.environ["NFT_LAYERS"])==json.loads(sys.argv[1]); print("nft-fw layers_equal=%s" % ok); sys.exit(0 if ok else 1)' "$nl" \
+            | tee -a "$RUNNER_TEMP/soak/prep.txt"
+          docker tag "$NFT_REF" ghcr.io/cassian-gate/nft-fw:latest
+          pull_tag quay.io/frrouting/frr@sha256:e995beaa50fdc9edb35eadcfefa29b7f062cc06f2b812613789b68fa541554d2 quay.io/frrouting/frr:10.7.1
+          pull_tag wbitt/network-multitool@sha256:db2810fe2c8d36db074eab5d98fbf861c8ed55e0786d648d3477b3de9135632e wbitt/network-multitool:latest
+          pull_tag alpine@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 alpine:latest
+          pull_tag nicolaka/netshoot@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61 nicolaka/netshoot:v0.15
+          pull_tag frrouting/frr@sha256:990e83490108b686fd6df3b1cafa6bdbb2714acb00eedb9a89693946f46f45ce frrouting/frr:latest
+          rec "disk_root_free_after_pulls=$(df -h / | awk 'NR==2{print $4}')"
+
+      - name: Checkout cassian-gate at the PC-3 pin
+        uses: actions/checkout@v4
+        with:
+          repository: cassian-gate/cassian-gate
+          ref: d396d5a668eff2b590bed9ef8352a7eb7c5c39e4
+
+      - name: Setup Python (pinned)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: "DIAG: step 35 lab up, fw1 state captured"
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$RUNNER_TEMP/soak/diag"; mkdir -p "$D"
+          ( for _ in $(seq 1 60); do echo "== $(date -u +%T.%N)"; docker ps -a --format '{{.Names}} {{.Status}}' | grep -E 'fw1|three-frr' ; sleep 0.5; done ) > "$D/ps-trace.txt" 2>&1 &
+          ./src/cassian.py up topologies/three-frr-two-hosts-fw-routed.yaml --reconfigure > "$D/up.txt" 2>&1; echo "up_rc=$?" | tee -a "$D/summary.txt"
+          wait
+          C=clab-three-frr-two-hosts-fw-routed-fw1
+          docker inspect "$C" --format 'Status={{.State.Status}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}} StartedAt={{.State.StartedAt}} FinishedAt={{.State.FinishedAt}} Restart={{.RestartCount}} Cmd={{json .Config.Cmd}} Entrypoint={{json .Config.Entrypoint}} Image={{.Config.Image}} Privileged={{.HostConfig.Privileged}}' 2>&1 | tee -a "$D/summary.txt"
+          docker logs "$C" > "$D/fw1-logs.txt" 2>&1
+          docker inspect "$C" > "$D/fw1-inspect.json" 2>&1
+          sudo dmesg -T | tail -n 80 > "$D/dmesg-tail.txt" 2>&1
+          sudo journalctl -u docker --since "-10 min" --no-pager | tail -n 120 > "$D/dockerd.txt" 2>&1
+          sudo containerlab inspect --all 2>&1 | tee "$D/clab-inspect.txt" > /dev/null
+          docker run --rm --entrypoint sh ghcr.io/cassian-gate/nft-fw:latest -c 'timeout 3 sleep infinity; echo sleep_infinity_rc=$?' 2>&1 | tee -a "$D/summary.txt"
+          tail -n 40 "$D/up.txt"; cat "$D/summary.txt"; cat "$D/fw1-logs.txt"; tail -n 30 "$D/dmesg-tail.txt"
+          ./src/cassian.py down three-frr-two-hosts-fw-routed > /dev/null 2>&1 || true
+
+      - name: "DIAG: step 40's commands (VM assertion leg) on W1's image -- information only"
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./src/cassian.py validate topologies/vm-assertion-smoke.yaml
+          ./src/cassian.py up topologies/vm-assertion-smoke.yaml --reconfigure
+          ./src/cassian.py test vm-assertion-smoke
+          ./src/cassian.py down vm-assertion-smoke
+
+      - name: Teardown
+        if: always()
+        shell: bash
+        run: sudo containerlab destroy --all --cleanup || true
+
+      - name: Diag summary
+        if: always()
+        shell: bash
+        run: |
+          { echo "## DIAG fw1"; echo '```'; cat "$RUNNER_TEMP/soak/baseline.txt" "$RUNNER_TEMP/soak/prep.txt" "$RUNNER_TEMP/soak/diag/summary.txt" 2>/dev/null; echo; cat "$RUNNER_TEMP/soak/diag/fw1-logs.txt" 2>/dev/null; echo; tail -n 30 "$RUNNER_TEMP/soak/diag/dmesg-tail.txt" 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
