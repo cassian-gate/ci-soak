@@ -51,6 +51,8 @@ jobs:
           sudo udevadm settle --timeout=30
           sudo chmod 0666 /dev/kvm
           test -w /dev/kvm
+          sudo modprobe br_netfilter
+          test -e /proc/sys/net/bridge/bridge-nf-call-ip6tables
 
       - name: Install containerlab 0.72.0
         shell: bash

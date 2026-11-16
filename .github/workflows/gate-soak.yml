@@ -66,6 +66,11 @@ jobs:
           ls -l /dev/kvm
           test -w /dev/kvm
           echo "/dev/kvm writable" | tee -a "$RUNNER_TEMP/soak/baseline.txt"
+          # Host provisioning as on ai-netsim (/etc/modules-load.d/br_netfilter.conf):
+          # the nft-fw node's sysctls need /proc/sys/net/bridge.
+          sudo modprobe br_netfilter
+          test -e /proc/sys/net/bridge/bridge-nf-call-ip6tables
+          echo "br_netfilter loaded" | tee -a "$RUNNER_TEMP/soak/baseline.txt"
 
       - name: "[soak A2] Install containerlab 0.72.0 (pinned, as ai-netsim)"
         shell: bash
