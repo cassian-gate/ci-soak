@@ -141,6 +141,7 @@ jobs:
       - name: "DIAG: step 35 lab up, fw1 state captured"
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           D="$RUNNER_TEMP/soak/diag"; mkdir -p "$D"
           ( for _ in $(seq 1 60); do echo "== $(date -u +%T.%N)"; docker ps -a --format '{{.Names}} {{.Status}}' | grep -E 'fw1|three-frr' ; sleep 0.5; done ) > "$D/ps-trace.txt" 2>&1 &
@@ -154,18 +155,9 @@ jobs:
           sudo journalctl -u docker --since "-10 min" --no-pager | tail -n 120 > "$D/dockerd.txt" 2>&1
           sudo containerlab inspect --all 2>&1 | tee "$D/clab-inspect.txt" > /dev/null
           docker run --rm --entrypoint sh ghcr.io/cassian-gate/nft-fw:latest -c 'timeout 3 sleep infinity; echo sleep_infinity_rc=$?' 2>&1 | tee -a "$D/summary.txt"
-          tail -n 40 "$D/up.txt"; cat "$D/summary.txt"; cat "$D/fw1-logs.txt"; tail -n 30 "$D/dmesg-tail.txt"
+          cp labs/clab-three-frr-two-hosts-fw-routed/*.clab.yml "$D/" 2>/dev/null; ls labs/clab-three-frr-two-hosts-fw-routed/ > "$D/labdir.txt" 2>&1
+          cat "$D/up.txt"; echo "---- ps trace (fw1)"; grep -E '^==|fw1' "$D/ps-trace.txt" | grep -B1 fw1 | head -n 40; cat "$D/summary.txt"; cat "$D/fw1-logs.txt"; tail -n 30 "$D/dmesg-tail.txt"
           ./src/cassian.py down three-frr-two-hosts-fw-routed > /dev/null 2>&1 || true
-
-      - name: "DIAG: step 40's commands (VM assertion leg) on W1's image -- information only"
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./src/cassian.py validate topologies/vm-assertion-smoke.yaml
-          ./src/cassian.py up topologies/vm-assertion-smoke.yaml --reconfigure
-          ./src/cassian.py test vm-assertion-smoke
-          ./src/cassian.py down vm-assertion-smoke
 
       - name: Teardown
         if: always()
@@ -176,4 +168,5 @@ jobs:
         if: always()
         shell: bash
         run: |
+          set +e
           { echo "## DIAG fw1"; echo '```'; cat "$RUNNER_TEMP/soak/baseline.txt" "$RUNNER_TEMP/soak/prep.txt" "$RUNNER_TEMP/soak/diag/summary.txt" 2>/dev/null; echo; cat "$RUNNER_TEMP/soak/diag/fw1-logs.txt" 2>/dev/null; echo; tail -n 30 "$RUNNER_TEMP/soak/diag/dmesg-tail.txt" 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
