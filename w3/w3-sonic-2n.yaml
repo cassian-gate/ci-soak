@@ -1,0 +1,109 @@
+name: w3-sonic-2n
+
+# Hosted-runner soak W3 (informational; Gate's scope is unchanged). Scratch repo
+# only, never committed to cassian-gate. Two sonic-vm guests in an eBGP chain
+# behind one FRR peer, plus one host behind the FRR peer.
+#
+#   h1 --- r1 (frr, AS 65181) --- s1 (sonic, AS 65182) --- s2 (sonic, AS 65183)
+#
+# SONiC renders asn and bgp.neighbors but not `networks`, so the only prefixes in
+# play are r1's: its loopback and h1's subnet. Multi-node evidence is therefore:
+# every session Established, r1's loopback received on s2 with the two-hop AS
+# path (s1 re-advertises), and a data-plane ping from h1 to s1 whose reply path
+# is s1's BGP-learned route to h1's subnet. A ping across both guests is not
+# constructible without SONiC advertising a prefix of its own (not rendered).
+#
+# Addresses are RFC 5737, outside sonic-vm:202405's stock ranges (10.0.0.0/26,
+# 10.1.0.0/24), unused by topologies/ at d396d5a. ASNs avoid 65100.
+
+nodes:
+  - name: r1
+    type: frr
+    asn: 65181
+    router_id: 192.0.2.181
+    networks:
+      - 192.0.2.181/32
+      - 198.51.100.208/29
+    bgp:
+      neighbors:
+        - peer: s1
+          remote_as: 65182
+
+  - name: s1
+    type: sonic-vm
+    runtime: vm
+    image: local/sonic-vm:202405
+    asn: 65182
+    router_id: 192.0.2.182
+    bgp:
+      neighbors:
+        - peer: r1
+          remote_as: 65181
+        - peer: s2
+          remote_as: 65183
+
+  - name: s2
+    type: sonic-vm
+    runtime: vm
+    image: local/sonic-vm:202405
+    asn: 65183
+    router_id: 192.0.2.183
+    bgp:
+      neighbors:
+        - peer: s1
+          remote_as: 65182
+
+  - name: h1
+    type: host
+    ip: 198.51.100.210/29
+    gw: 198.51.100.209
+
+links:
+  - endpoints: ["r1:eth1", "s1:eth1"]
+    ipv4: ["198.51.100.200/31", "198.51.100.201/31"]
+
+  - endpoints: ["s1:eth2", "s2:eth1"]
+    ipv4: ["198.51.100.202/31", "198.51.100.203/31"]
+
+  - endpoints: ["h1:eth1", "r1:eth2"]
+    ipv4: ["198.51.100.210/29", "198.51.100.209/29"]
+
+tests:
+  - name: w3_s1_r1_session_up
+    kind: invariant
+    type: bgp_session_up
+    node: s1
+    neighbor: 198.51.100.200
+    expect: pass
+    timeout_s: 120
+
+  - name: w3_s1_s2_session_up
+    kind: invariant
+    type: bgp_session_up
+    node: s1
+    neighbor: 198.51.100.203
+    expect: pass
+    timeout_s: 120
+
+  - name: w3_s2_s1_session_up
+    kind: invariant
+    type: bgp_session_up
+    node: s2
+    neighbor: 198.51.100.202
+    expect: pass
+    timeout_s: 120
+
+  - name: w3_s2_r1_loopback_two_hop_as_path
+    kind: invariant
+    type: bgp_as_path
+    node: s2
+    prefix: 192.0.2.181/32
+    as_path: "_65182_65181_"
+    expect: pass
+
+  - name: w3_h1_to_s1_dataplane_ping
+    kind: ping
+    src: h1
+    to_ip: 198.51.100.201
+    expect: pass
+    timeout_s: 60
