@@ -1,0 +1,211 @@
+# Hosted-runner soak W3 -- multi-node SONiC (informational; Gate's scope is
+# unchanged). Scratch repo cassian-gate/ci-soak only. Runs Gate at the PC-3 pin
+# on the 2- or 3-node topology from this repo, sampling RAM and swap every 2 s
+# for the whole run and each SONiC guest's container health (readiness).
+name: W3 multi-node SONiC
+
+on:
+  workflow_dispatch:
+    inputs:
+      topo:
+        description: "Topology: w3-sonic-2n or w3-sonic-3n"
+        type: choice
+        options: [w3-sonic-2n, w3-sonic-3n]
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  w3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PIN: d396d5a668eff2b590bed9ef8352a7eb7c5c39e4
+      TOPO: ${{ inputs.topo }}
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: src
+    steps:
+      - name: Runner baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/w3"
+          {
+            echo "topo=$TOPO run_id=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT start_utc=$(date -u +%FT%TZ)"
+            echo "vcpu=$(nproc) mem_total_kib=$(awk '/MemTotal/{print $2}' /proc/meminfo) swap_total_kib=$(awk '/SwapTotal/{print $2}' /proc/meminfo)"
+            echo "cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+            echo "image_os=${ImageOS:-unknown} image_version=${ImageVersion:-unknown}"
+          } | tee "$RUNNER_TEMP/w3/summary.txt"
+          test -e /dev/kvm
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -w /dev/kvm
+
+      - name: Install containerlab 0.72.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E bash -c "$(curl -sL https://get.containerlab.dev)" -- -v 0.72.0
+          containerlab version | grep -Eq '^[[:space:]]*version:[[:space:]]*0\.72\.0[[:space:]]*$'
+
+      - name: Log in to ghcr.io (read)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull images by pinned digest; E1 before the SONiC local tag
+        shell: bash
+        env:
+          SONIC_REF: "ghcr.io/cassian-gate/sonic-vm@sha256:29527a63aec3422e0eda0e953bc4cd29930eb98523d7ac960d0cd05f82957151"
+          SONIC_LAYERS: '["sha256:66462cc862fe2053b9863fefa3866e07bb5dfb06f6b3ce3177cc096e4021aabe","sha256:28a67079e0fc0971ec736ceded35c9563015b8a86cd4971cd3284d84293db9d6","sha256:f42b40d4bcc2d45560476ee10603449840bace56fe51e93fcde7c1a0c1071e35","sha256:8b9f6a93a1a6b39da64c074f2c2a457948c56ee8676c0537cf5d12a58bbb231c","sha256:ee057f702a74e9205da0d746d536ed55b09373cdca50d59347c436bfe7bdd9ec"]'
+          SONIC_QCOW2_SHA256: dda614679cfeed69aa4b6e2b8f9dbdf68c2d0671eceef8ca42f9b6832f120817
+        run: |
+          set -euo pipefail
+          rec() { echo "$*" | tee -a "$RUNNER_TEMP/w3/summary.txt"; }
+          docker pull -q "$SONIC_REF" >/dev/null
+          layers=$(docker image inspect -f '{{json .RootFS.Layers}}' "$SONIC_REF")
+          python3 -c 'import json,os,sys; ok=json.loads(os.environ["SONIC_LAYERS"])==json.loads(sys.argv[1]); print("E1 layers_equal=%s" % ok); sys.exit(0 if ok else 1)' "$layers" \
+            | tee -a "$RUNNER_TEMP/w3/summary.txt"
+          q=$(docker run --rm --network none -w / --entrypoint sha256sum "$SONIC_REF" sonic-vs-202405.qcow2 | awk '{print $1}')
+          if [ "$q" = "$SONIC_QCOW2_SHA256" ]; then rec "E1 qcow2_equal=True"; else rec "E1 qcow2_equal=False ($q)"; exit 1; fi
+          docker tag "$SONIC_REF" local/sonic-vm:202405
+          docker pull -q quay.io/frrouting/frr@sha256:e995beaa50fdc9edb35eadcfefa29b7f062cc06f2b812613789b68fa541554d2 >/dev/null
+          docker tag quay.io/frrouting/frr@sha256:e995beaa50fdc9edb35eadcfefa29b7f062cc06f2b812613789b68fa541554d2 quay.io/frrouting/frr:10.7.1
+          docker pull -q wbitt/network-multitool@sha256:db2810fe2c8d36db074eab5d98fbf861c8ed55e0786d648d3477b3de9135632e >/dev/null
+          docker tag wbitt/network-multitool@sha256:db2810fe2c8d36db074eab5d98fbf861c8ed55e0786d648d3477b3de9135632e wbitt/network-multitool:latest
+
+      - name: Check out this repo (topologies)
+        uses: actions/checkout@v4
+        with:
+          path: soak
+
+      - name: Check out cassian-gate at the PC-3 pin
+        uses: actions/checkout@v4
+        with:
+          repository: cassian-gate/cassian-gate
+          ref: ${{ env.PIN }}
+          path: cg
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Gate's Python dependencies
+        shell: bash
+        working-directory: cg
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Start RAM/swap/readiness sampler (every 2 s)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/w3/sampler.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # epoch mem_used_mib mem_avail_mib swap_used_mib then name=health per SONiC guest
+          while :; do
+            m=$(free -m | awk '/^Mem:/{print $3, $7} /^Swap:/{print $3}' | xargs)
+            h=$(docker ps -a --filter "name=clab-${TOPO}-s" --format '{{.Names}}={{.Status}}' 2>/dev/null \
+                | sed -E 's/=.*\((healthy|unhealthy|health: starting)\).*/=\1/; s/=Up [^=]*$/=up/' | sort | xargs)
+            echo "$(date +%s) $m $h"
+            sleep 2
+          done
+          EOF
+          chmod +x "$RUNNER_TEMP/w3/sampler.sh"
+          nohup "$RUNNER_TEMP/w3/sampler.sh" > "$RUNNER_TEMP/w3/samples.txt" 2>&1 &
+          echo $! > "$RUNNER_TEMP/w3/sampler.pid"
+          sleep 3; head -n 2 "$RUNNER_TEMP/w3/samples.txt"
+
+      - name: Gate validate (refusal recorded verbatim)
+        shell: bash
+        working-directory: cg
+        run: |
+          set -uo pipefail
+          cp "../soak/w3/${TOPO}.yaml" "$RUNNER_TEMP/w3/"
+          ./src/cassian.py validate "../soak/w3/${TOPO}.yaml" 2>&1 | tee "$RUNNER_TEMP/w3/validate.txt"
+          rc=${PIPESTATUS[0]}
+          echo "validate_rc=$rc" | tee -a "$RUNNER_TEMP/w3/summary.txt"
+          exit "$rc"
+
+      - name: Gate up / test / down (timed)
+        shell: bash
+        working-directory: cg
+        run: |
+          set -uo pipefail
+          rec() { echo "$*" | tee -a "$RUNNER_TEMP/w3/summary.txt"; }
+          t0=$(date +%s); echo "$t0" > "$RUNNER_TEMP/w3/up_start_epoch"
+          ./src/cassian.py up "../soak/w3/${TOPO}.yaml" --reconfigure 2>&1 | tee "$RUNNER_TEMP/w3/up.txt"
+          up_rc=${PIPESTATUS[0]}; t1=$(date +%s); rec "up_rc=$up_rc up_s=$((t1 - t0))"
+          test_rc=skipped
+          if [ "$up_rc" -eq 0 ]; then
+            ./src/cassian.py test "$TOPO" 2>&1 | tee "$RUNNER_TEMP/w3/test.txt"
+            test_rc=${PIPESTATUS[0]}
+          fi
+          t2=$(date +%s); rec "test_rc=$test_rc test_s=$((t2 - t1))"
+          cp "labs/clab-${TOPO}/results.json" "$RUNNER_TEMP/w3/results.json" 2>/dev/null || rec "results.json: absent"
+          ./src/cassian.py down "$TOPO" 2>&1 | tail -n 5
+          t3=$(date +%s); rec "down_s=$((t3 - t2)) wall_up_to_down_s=$((t3 - t0))"
+          [ "$up_rc" -eq 0 ] && [ "$test_rc" = 0 ]
+
+      - name: Stop sampler and summarise
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          kill "$(cat "$RUNNER_TEMP/w3/sampler.pid")" 2>/dev/null || true
+          python3 - "$RUNNER_TEMP/w3" <<'PY'
+          import json, os, sys
+          d = sys.argv[1]
+          rows = [l.split() for l in open(os.path.join(d, "samples.txt")) if l[:1].isdigit()]
+          up0 = None
+          try:
+              up0 = int(open(os.path.join(d, "up_start_epoch")).read().strip())
+          except Exception:
+              pass
+          peak_used = max((int(r[1]) for r in rows if len(r) > 3), default=None)
+          min_avail = min((int(r[2]) for r in rows if len(r) > 3), default=None)
+          peak_swap = max((int(r[3]) for r in rows if len(r) > 3), default=None)
+          first_healthy = {}
+          for r in rows:
+              for kv in r[4:]:
+                  n, _, h = kv.partition("=")
+                  if h == "healthy" and n not in first_healthy:
+                      first_healthy[n] = int(r[0]) - up0 if up0 else None
+          out = {"samples": len(rows), "peak_mem_used_mib": peak_used, "min_mem_available_mib": min_avail,
+                 "peak_swap_used_mib": peak_swap, "first_healthy_s_after_up_start": first_healthy}
+          try:
+              res = json.load(open(os.path.join(d, "results.json")))
+              out["results_top_level_keys"] = sorted(res)[:40]
+          except Exception as e:
+              out["results"] = "unreadable: %s" % e
+          json.dump(out, open(os.path.join(d, "w3-measures.json"), "w"), indent=1, sort_keys=True)
+          print(json.dumps(out, indent=1, sort_keys=True))
+          PY
+          { echo "## W3 ${TOPO}"; echo '```'; cat "$RUNNER_TEMP/w3/summary.txt" "$RUNNER_TEMP/w3/w3-measures.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Teardown (any lab left behind)
+        if: always()
+        shell: bash
+        run: sudo containerlab destroy --all --cleanup || true
+
+      - name: Upload W3 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w3-${{ inputs.topo }}
+          path: ${{ runner.temp }}/w3/
+          if-no-files-found: warn
